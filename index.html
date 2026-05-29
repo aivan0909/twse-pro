@@ -233,28 +233,74 @@ const fmtNT=n=>n==null?'—':`$${fmt(n,0)}`;
 const sign=n=>n>=0?'+':'';
 const cls=n=>n>0?'cu':n<0?'cd':'cn';
 
+// ── localStorage helpers ──────────────────────────────────────────────────────
+const LS_KEY = 'twse-pro-holdings-v2';
+const LS_ALERTS = 'twse-pro-alerts-v1';
+
+function makeHolding(id, name, shares, cost){
+  return {id, name:name||id, shares:+shares, cost:+cost,
+    price:null, change:null, changePct:null, history:null,
+    chip:null, source:null, flash:'', updatedAt:null};
+}
+
+function saveHoldings(holdings){
+  try{
+    const slim = holdings.map(h=>({id:h.id,name:h.name,shares:h.shares,cost:h.cost}));
+    localStorage.setItem(LS_KEY, JSON.stringify(slim));
+  }catch{}
+}
+
+function loadHoldings(){
+  try{
+    const raw = localStorage.getItem(LS_KEY);
+    if(raw){
+      const arr = JSON.parse(raw);
+      if(Array.isArray(arr) && arr.length) return arr.map(h=>makeHolding(h.id,h.name,h.shares,h.cost));
+    }
+  }catch{}
+  return null;
+}
+
+function saveAlerts(alerts){
+  try{ localStorage.setItem(LS_ALERTS, JSON.stringify(alerts)); }catch{}
+}
+
+function loadAlerts(){
+  try{
+    const raw = localStorage.getItem(LS_ALERTS);
+    if(raw){ const arr=JSON.parse(raw); if(Array.isArray(arr)) return arr; }
+  }catch{}
+  return [];
+}
+
+// ── 預設持股清單（首次開啟時使用） ───────────────────────────────────────────
+const DEFAULT_HOLDINGS = [
+  makeHolding('2330','台積電',  200, 680),
+  makeHolding('2317','鴻海',    500, 105),
+  makeHolding('2454','聯發科',  100, 900),
+  makeHolding('0050','元大台灣50',300,148),
+  makeHolding('2412','中華電',  400, 124),
+];
+
 // ── state ─────────────────────────────────────────────────────────────────────
+const _savedHoldings = loadHoldings();
+const _savedAlerts   = loadAlerts();
+
 let state = {
-  holdings: [
-    {id:'2330',name:'台積電',  shares:200,cost:680, price:null,change:null,changePct:null,history:null,chip:null,source:null,flash:'',updatedAt:null},
-    {id:'2317',name:'鴻海',    shares:500,cost:105, price:null,change:null,changePct:null,history:null,chip:null,source:null,flash:'',updatedAt:null},
-    {id:'2454',name:'聯發科',  shares:100,cost:900, price:null,change:null,changePct:null,history:null,chip:null,source:null,flash:'',updatedAt:null},
-    {id:'0050',name:'元大台灣50',shares:300,cost:148,price:null,change:null,changePct:null,history:null,chip:null,source:null,flash:'',updatedAt:null},
-    {id:'2412',name:'中華電',  shares:400,cost:124, price:null,change:null,changePct:null,history:null,chip:null,source:null,flash:'',updatedAt:null},
-  ],
-  selected: '2330',
-  tab: 'kline',       // kline | chip | alerts | export
-  mobileTab: 'list',  // list | center | right
+  holdings: _savedHoldings || DEFAULT_HOLDINGS,
+  selected: (_savedHoldings||DEFAULT_HOLDINGS)[0]?.id || '2330',
+  tab: 'kline',
+  mobileTab: 'list',
   kRange: 30,
   indicators: {ma5:true, ma10:true, bb:false, kd:false},
   apiKey: '',
   wsStatus: 'offline',
   lastUpdate: null,
-  alerts: [],
+  alerts: _savedAlerts,
   loading: false,
   toast: null,
-  modals: {key:false, add:false},
-  kdValues: {},       // stockId -> [{k,d,date}]
+  modals: {key:false, add:false, batch:false, csv:false},
+  kdValues: {},
   deferredPrompt: null,
   showInstall: false,
 };
@@ -266,6 +312,8 @@ let flashTimers = {};
 function getState(){ return state; }
 function setState(patch){
   state = {...state, ...patch};
+  if(patch.holdings) saveHoldings(state.holdings);
+  if(patch.alerts)   saveAlerts(state.alerts);
   render();
 }
 
@@ -884,6 +932,45 @@ function render(){
       <button onclick="state.showInstall=false;render()" style="background:transparent;border:none;color:var(--acc);cursor:pointer;font-size:16px">✕</button>
     </div>` : '';
 
+  // ── batch modal ──
+  const batchModalHTML = s.modals.batch ? `
+    <div class="mbg show" onclick="if(event.target===this){state.modals.batch=false;render()}">
+      <div class="modal">
+        <div class="mtitle">批次新增持股</div>
+        <div class="mdesc">每行一檔股票，支援以下格式：<br>
+          <code style="font-size:11px;background:var(--bg4);padding:2px 5px;border-radius:3px">2330</code> 僅代號（股數預設1000，成本填0）<br>
+          <code style="font-size:11px;background:var(--bg4);padding:2px 5px;border-radius:3px">2330,台積電,200,680</code> 完整格式
+        </div>
+        <textarea id="batch-input" style="width:100%;height:140px;background:var(--bg1);border:1px solid var(--border2);color:var(--t0);font-family:var(--mono);font-size:12px;padding:8px 10px;border-radius:4px;outline:none;resize:vertical;margin-bottom:8px" placeholder="2330,台積電,200,680&#10;2317,鴻海,500,105&#10;6207,雷科,1000,113&#10;..."></textarea>
+        <div class="mbtns">
+          <button class="mcancel" onclick="state.modals.batch=false;render()">取消</button>
+          <button class="mok" onclick="addBatch()">批次新增</button>
+        </div>
+      </div>
+    </div>` : '';
+
+  // ── CSV modal ──
+  const csvModalHTML = s.modals.csv ? `
+    <div class="mbg show" onclick="if(event.target===this){state.modals.csv=false;render()}">
+      <div class="modal">
+        <div class="mtitle">CSV 匯入持股</div>
+        <div class="mdesc">上傳 CSV 或 Excel 匯出的 CSV 檔。<br>
+          欄位順序：<code style="font-size:11px;background:var(--bg4);padding:2px 5px;border-radius:3px">代號, 名稱, 股數, 成本</code><br>
+          第一行為標題列時會自動跳過。
+        </div>
+        <div style="border:2px dashed var(--border2);border-radius:6px;padding:20px;text-align:center;margin-bottom:10px">
+          <div style="font-size:13px;color:var(--t1);margin-bottom:10px">選擇 CSV 檔案</div>
+          <input type="file" accept=".csv,.txt" onchange="handleCSVImport(event)" style="font-family:var(--mono);font-size:12px;color:var(--t1)">
+        </div>
+        <div style="font-size:11px;color:var(--t2);margin-bottom:10px">
+          CSV 範例：<br>
+          2330,台積電,200,680<br>
+          6207,雷科,1000,113.5
+        </div>
+        <button class="mcancel" onclick="state.modals.csv=false;render()" style="width:100%">關閉</button>
+      </div>
+    </div>` : '';
+
   // ── compose HTML ──
   const isMobile = window.innerWidth <= 819;
   const leftActive  = !isMobile || s.mobileTab==='list';
@@ -900,7 +987,10 @@ function render(){
         <button class="tbtn" onclick="loadTWSE()" ${s.loading?'disabled':''}>📊 TWSE</button>
         ${keyBtn}
         ${wsBtn}
-        <button class="tbtn" onclick="state.modals.add=true;render()">＋</button>
+        <button class="tbtn" onclick="state.modals.add=true;render()">＋ 單筆</button>
+        <button class="tbtn" onclick="state.modals.batch=true;render()">批次</button>
+        <button class="tbtn" onclick="state.modals.csv=true;render()">CSV</button>
+        <button class="tbtn r" onclick="clearAllHoldings()" title="清除全部持股">清除</button>
       </div>
     </div>
     <!-- summary -->
@@ -912,7 +1002,9 @@ function render(){
         <div class="ph">
           <span class="ptitle">持股列表</span>
           <div class="pact">
-            <button class="pbtn" onclick="state.modals.add=true;render()">＋新增</button>
+            <button class="pbtn" onclick="state.modals.add=true;render()">＋單筆</button>
+            <button class="pbtn" onclick="state.modals.batch=true;render()">批次</button>
+            <button class="pbtn" onclick="state.modals.csv=true;render()">CSV</button>
             <button class="pbtn ${s.tab==='export'?'sel':''}" onclick="state.mobileTab='right';state.tab='export';render()">匯出</button>
           </div>
         </div>
@@ -958,7 +1050,7 @@ function render(){
     <!-- toast -->
     ${s.toast?`<div class="toast">${s.toast}</div>`:''}
     <!-- modals -->
-    ${keyModalHTML}${addModalHTML}
+    ${keyModalHTML}${addModalHTML}${batchModalHTML}${csvModalHTML}
   `;
 
   // ── Draw canvas after render ──
@@ -1001,10 +1093,93 @@ function addHolding(){
   const shares = parseFloat(document.getElementById('add-shares')?.value);
   const cost   = parseFloat(document.getElementById('add-cost')?.value);
   if(!id||!shares||!cost){ showToast('❌ 請填寫代號、股數、成本'); return; }
-  const newH = {id, name:name||id, shares, cost, price:null, change:null, changePct:null, history:null, chip:null, source:null, flash:'', updatedAt:null};
-  setState({holdings:[...state.holdings,newH], modals:{...state.modals,add:false}});
-  // Try load
-  fetchTWSEStock(id).then(d=>{ if(d){ const hs=state.holdings.map(h=>h.id===id?{...h,...d}:h); setState({holdings:hs}); }}).catch(()=>{});
+  if(state.holdings.find(h=>h.id===id)){ showToast('⚠️ '+id+' 已在清單中'); return; }
+  const newH = makeHolding(id, name||id, shares, cost);
+  const newHoldings = [...state.holdings, newH];
+  setState({holdings:newHoldings, modals:{...state.modals,add:false}});
+  showToast('✓ 已新增 '+id+'，正在抓取收盤資料...');
+  // Auto-fetch TWSE immediately after adding
+  fetchTWSEStock(id).then(d=>{
+    if(d){
+      const hs = state.holdings.map(h=>h.id===id?{...h,...d}:h);
+      setState({holdings:hs});
+      showToast('✓ '+id+(d.price?' $'+d.price:'')+' 收盤資料已載入');
+    } else {
+      showToast('⚠️ '+id+' 找不到 TWSE 資料，請確認代號');
+    }
+  }).catch(()=>showToast('⚠️ 網路錯誤，請按 TWSE 重新載入'));
+}
+
+// ── 批次新增 ───────────────────────────────────────────────────────────────────
+function addBatch(){
+  const raw = document.getElementById('batch-input')?.value?.trim();
+  if(!raw){ showToast('❌ 請輸入股票資料'); return; }
+  const lines = raw.split(/\n/).map(l=>l.trim()).filter(l=>l);
+  const newOnes = [];
+  const errors = [];
+  lines.forEach(line => {
+    // Support formats: "2330" / "2330 台積電" / "2330,台積電,1000,680" / "2330 台積電 1000 680"
+    const parts = line.split(/[,\s]+/);
+    const id = parts[0]?.trim();
+    if(!id || !/^\d{4,6}$/.test(id)){ errors.push(line); return; }
+    if(state.holdings.find(h=>h.id===id) || newOnes.find(h=>h.id===id)){ return; }
+    const name   = parts[1] && isNaN(parts[1]) ? parts[1] : id;
+    const shares = parseFloat(parts[2]) || 1000;
+    const cost   = parseFloat(parts[3]) || 0;
+    newOnes.push(makeHolding(id, name, shares, cost));
+  });
+  if(!newOnes.length){ showToast('⚠️ 沒有新的有效代號（已存在或格式錯誤）'); return; }
+  const newHoldings = [...state.holdings, ...newOnes];
+  setState({holdings:newHoldings, modals:{...state.modals,batch:false}});
+  showToast('✓ 已新增 '+newOnes.length+' 檔，正在批次載入收盤資料...');
+  if(errors.length) showToast('⚠️ 以下無法識別：'+errors.join(', '));
+  // Batch fetch TWSE
+  Promise.all(newOnes.map(h =>
+    fetchTWSEStock(h.id).then(d=>{
+      if(d){ const hs=state.holdings.map(x=>x.id===h.id?{...x,...d}:x); setState({holdings:hs}); }
+    }).catch(()=>{})
+  )).then(()=> showToast('✓ 批次收盤資料載入完成'));
+}
+
+// ── CSV 匯入 ───────────────────────────────────────────────────────────────────
+function handleCSVImport(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const text = ev.target.result;
+    const lines = text.split(/\r?\n/).filter(l=>l.trim());
+    const newOnes = [];
+    // Skip header row if first cell isn't a stock id
+    const start = /^\d{4,6}/.test(lines[0]?.split(/[,\t]/)[0]) ? 0 : 1;
+    for(let i=start;i<lines.length;i++){
+      const cols = lines[i].split(/[,\t]/);
+      const id = cols[0]?.trim().replace(/"/g,'');
+      if(!id||!/^\d{4,6}$/.test(id)) continue;
+      if(state.holdings.find(h=>h.id===id)||newOnes.find(h=>h.id===id)) continue;
+      const name   = cols[1]?.trim().replace(/"/g,'') || id;
+      const shares = parseFloat(cols[2]) || 1000;
+      const cost   = parseFloat(cols[3]) || 0;
+      newOnes.push(makeHolding(id, name, shares, cost));
+    }
+    if(!newOnes.length){ showToast('⚠️ CSV 中找不到有效的股票代號'); return; }
+    const newHoldings = [...state.holdings, ...newOnes];
+    setState({holdings:newHoldings, modals:{...state.modals,csv:false}});
+    showToast('✓ CSV 匯入 '+newOnes.length+' 檔，載入收盤資料中...');
+    Promise.all(newOnes.map(h=>
+      fetchTWSEStock(h.id).then(d=>{
+        if(d){ const hs=state.holdings.map(x=>x.id===h.id?{...x,...d}:x); setState({holdings:hs}); }
+      }).catch(()=>{})
+    )).then(()=>showToast('✓ CSV 收盤資料載入完成'));
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+// ── 清除所有持股 ──────────────────────────────────────────────────────────────
+function clearAllHoldings(){
+  if(!confirm('確定要清除所有持股嗎？')) return;
+  setState({holdings:[], selected:''});
+  showToast('✓ 已清除所有持股');
 }
 
 function addAlert(){
